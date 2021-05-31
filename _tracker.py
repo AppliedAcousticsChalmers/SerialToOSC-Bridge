@@ -1,32 +1,32 @@
 import re
+import sys
 from enum import auto, Enum, IntEnum
 from time import sleep
 
 import serial
+from pythonosc import udp_client
 
-from . import mp_context, tools
-from ._subprocess import SubProcess
+import tools
 
 
-class HeadTracker(SubProcess):
+def print_warn(text):
+    print(text, file=sys.stderr)
+
+
+class HeadTracker(object):
     """
-    Base functionality to run data acquisition from a head tracker contained in a separate
-    process. To run the process the functions `start()`, `join()` and `terminate()` have to be
-    used.
+    Base functionality to run data acquisition from a head tracker.
 
     Attributes
     ----------
-    _position_raw : multiprocessing.Array
+    _position_raw : list of float
         data array containing the absolute head position received directly from the tracker in the
-        form of `HeadTracker.DataIndex`, process-safe to be accessed by different functions of
-        the tracker
-    _position_zero : multiprocessing.Array
+        form of `HeadTracker.DataIndex`
+    _position_zero : list of float
         data array containing the reference head position saved position reset in the form of
-        `HeadTracker.DataIndex`, process-safe to be accessed by different functions of the tracker
-    _position_shared : multiprocessing.Array
+        `HeadTracker.DataIndex`
         data array containing the relative head position after reset in the form of
-        `HeadTracker.DataIndex`, process-safe to be accessed by different subprocesses of this
-        application as well
+        `HeadTracker.DataIndex`
     """
 
     class Type(Enum):
@@ -57,14 +57,6 @@ class HeadTracker(SubProcess):
         Used by`HeadTracker` to receive head tracking data over a serial port like
         "/dev/tty.usbserial-AH03F9XC" when adapted to USB. """
 
-        VRPN = auto()
-        """Generic VRPN interface to receive tracking data from a Virtual Reality Peripheral
-        Network server application.
-        https://github.com/vrpn/vrpn/wiki
-
-        Currently not used or implemented.
-        """
-
         AUTO_ROTATE = auto()
         """Generic functionality to not read tracking data from a device, but generate an
         automatically increasing azimuth angle resulting in a virtually rotating sound scene. """
@@ -80,21 +72,27 @@ class HeadTracker(SubProcess):
         X, Y, Z, AZIM, ELEV, TILT = range(6)
 
     @staticmethod
-    def create_instance_by_type(name, tracker_type, tracker_port, *args, **kwargs):
+    def create_instance_by_type(
+        device_type, serial_port, osc_address, osc_port, osc_target
+    ):
         """
         Static method to instantiate one of the from `HeadTracker` deriving classes, depending on
         the given `HeadTracker.Type`.
 
         Parameters
         ----------
-        name : str
-            name of the spawned tracker process
-        tracker_type : str or int
+        device_type : str or int
             direct identifier value or string containing the name of one of the provided
             `HeadTracker.Type` members
-        tracker_port : str
-            system specific path to tracker interface being provided by an appropriate hardware
-            driver
+        serial_port : str
+            system specific path to tracker interface being provided by an appropriate
+            hardware driver
+        osc_address : str
+            IP address of OSC target
+        osc_port : int
+            IP port of OSC target
+        osc_target : str
+            OSC target address, usually in the shape of "/client/parameter"
 
         Returns
         -------
@@ -106,19 +104,16 @@ class HeadTracker(SubProcess):
         ValueError
             in case an unknown tracker type is given
         """
-        _type = tools.transform_into_type(tracker_type, HeadTracker.Type)
-        if _type is None:
-            return HeadTracker(name, tracker_port, *args, **kwargs)
-        elif _type == HeadTracker.Type.AUTO_ROTATE:
-            return HeadTrackerRotate(name, tracker_port, *args, **kwargs)
+        _type = tools.transform_into_type(device_type, HeadTracker.Type)
+        if _type == HeadTracker.Type.AUTO_ROTATE:
+            return HeadTrackerRotate(serial_port, osc_address, osc_port, osc_target)
         elif _type == HeadTracker.Type.POLHEMUS_PATRIOT:
-            return HeadTrackerPatriot(name, tracker_port, *args, **kwargs)
+            return HeadTrackerPatriot(serial_port, osc_address, osc_port, osc_target)
         elif _type == HeadTracker.Type.POLHEMUS_FASTRACK:
-            return HeadTrackerFastrack(name, tracker_port, *args, **kwargs)
+            return HeadTrackerFastrack(serial_port, osc_address, osc_port, osc_target)
         elif _type == HeadTracker.Type.RAZOR_AHRS:
-            return HeadTrackerRazor(name, tracker_port, *args, **kwargs)
+            return HeadTrackerRazor(serial_port, osc_address, osc_port, osc_target)
 
-    # noinspection PyTypeChecker
     @staticmethod
     def print_data(array):
         """
@@ -137,35 +132,31 @@ class HeadTracker(SubProcess):
                 s = f"{s}, "
         return f"{s}]"
 
-    # noinspection PyTypeChecker
-    def __init__(self, name, tracker_port, *args, **kwargs):
+    def __init__(self, serial_port, osc_address, osc_port, osc_target):
         """
         Create new instance of a positional head tracker in a separate process.
 
         Parameters
         ----------
-        name : str
-            name of the spawned tracker process
-        tracker_port : str
+        serial_port : str
             system specific path to tracker interface being provided by an appropriate hardware
             driver
         """
-        super().__init__(name, *args, **kwargs)
+        # initialize data arrays
+        self._position_raw = [0.0] * len(HeadTracker.DataIndex)
+        self._position_zero = [0.0] * len(HeadTracker.DataIndex)
+        self._position_shared = [0.0] * len(HeadTracker.DataIndex)
 
-        self._position_raw = mp_context.Array(
-            typecode_or_type="f", size_or_initializer=len(HeadTracker.DataIndex)
-        )
-        self._position_zero = mp_context.Array(
-            typecode_or_type="f", size_or_initializer=len(HeadTracker.DataIndex)
-        )
-        self._position_shared = mp_context.Array(
-            typecode_or_type="f", size_or_initializer=len(HeadTracker.DataIndex)
-        )
+        self._init_tracker(serial_port)
 
-        self._init_tracker(tracker_port)
-
-        # setting up OSC sender
-        self._init_osc_client()
+        # initialize sending OSC client
+        self._osc_target = osc_target
+        self._osc_client = udp_client.SimpleUDPClient(
+            address=osc_address, port=osc_port
+        )
+        print(
+            f"sending OSC messages at ({osc_address}, {osc_port}, {self._osc_target}) ..."
+        )
 
     def _init_tracker(self, _):
         """
@@ -181,7 +172,7 @@ class HeadTracker(SubProcess):
         """
         self._timeout = 1 / 60  # data send rate
 
-        self._logger.warning("... no tracker will be used.")
+        print_warn("... no tracker will be used.")
 
     def run(self):
         """
@@ -190,34 +181,32 @@ class HeadTracker(SubProcess):
         values regularly and makes the process stay alive until the according
         `multiprocessing.Event` is set.
         """
-        self._logger.debug("running TRACKER ...")
+        print("running TRACKER ...")
         try:
-            while not self._event_terminate.is_set():
+            while True:
                 # individual implementation to read data
                 self._read_data()
 
-                # update shared value by current value in a process-safe manner
-                with self._position_shared.get_lock():
-                    for i in HeadTracker.DataIndex:
-                        self._position_shared[i] = (
-                            self._position_raw[i] - self._position_zero[i]
-                        )
+                # update shared value by current value
+                for i in HeadTracker.DataIndex:
+                    self._position_shared[i] = (
+                        self._position_raw[i] - self._position_zero[i]
+                    )
 
-                # communicate current value
+                # wrap shared values
                 angles_deg = tools.transform_into_wrapped_angles(
                     azim=self._position_shared[HeadTracker.DataIndex.AZIM],
                     elev=self._position_shared[HeadTracker.DataIndex.ELEV],
                     tilt=self._position_shared[HeadTracker.DataIndex.TILT],
                     is_deg=True,
                 )
-                if self._osc_client:
-                    self._osc_client.send_message(
-                        f"{self._osc_name}/AzimElevTilt", angles_deg
-                    )
-                # else:
-                #     self._logger.debug(f'azimuth, elevation, tilt degrees {angles_deg}')
+
+                # send shared data
+                self._osc_client.send_message(
+                    address=self._osc_target, value=angles_deg
+                )
         except KeyboardInterrupt:
-            self._logger.error("interrupted by user.")
+            print_warn("interrupted by user.")
 
     def _read_data(self):
         """
@@ -235,36 +224,9 @@ class HeadTracker(SubProcess):
         for i in HeadTracker.DataIndex:
             self._position_zero[i] = self._position_raw[i]
 
-        self._logger.info(
+        print_warn(
             f"setting head tracker zero position to {HeadTracker.print_data(self._position_zero)}."
         )
-
-    def set_azimuth_position(self, azim_deg=0.0):
-        """
-        Parameters
-        ----------
-        azim_deg : float, optional
-            azimuth position in degrees, used to manually set the head rotation in relation to the
-            set reference position
-        """
-        self._position_raw[HeadTracker.DataIndex.AZIM] = (
-            self._position_zero[HeadTracker.DataIndex.AZIM] + azim_deg
-        )
-
-        self._logger.info(
-            f"setting head tracker azimuth position to [AZIM={azim_deg:.1f}]."
-        )
-
-    def get_shared_position(self):
-        """
-        Returns
-        -------
-        multiprocessing.Array
-            Data array always being updated to contain the relative tracked position in the order of
-            `HeadTracker.DataIndex`. Other subprocesses of this application can access the data via
-            this shared address.
-        """
-        return self._position_shared
 
 
 class HeadTrackerRotate(HeadTracker):
@@ -289,7 +251,7 @@ class HeadTrackerRotate(HeadTracker):
         self._timeout = 1 / 60  # data send rate
         self._position_step = [0, 0, 0, 0.5, 0, 0]  # x, y, z, azim, elev, tilt
 
-        self._logger.info(
+        print(
             f'opened tracker "AUTO_ROTATE"\n'
             f" --> send_rate: {1 / self._timeout} Hz, step_size: {self._position_step[3:]} deg"
         )
@@ -301,13 +263,11 @@ class HeadTrackerRotate(HeadTracker):
         """
         sleep(self._timeout)
 
-        with self._position_raw.get_lock():
-            for i in HeadTracker.DataIndex:
-                self._position_raw[i] += self._position_step[i]
+        for i in HeadTracker.DataIndex:
+            self._position_raw[i] += self._position_step[i]
 
 
 class HeadTrackerSerial(HeadTracker):
-    # noinspection PyUnresolvedReferences
     """
     Extended `HeadTracker` implementation for acquiring data provided via a serial port. Usually
     these are nowadays still easily accessible via USB-to-Serial-adapters, providing a virtual
@@ -361,7 +321,7 @@ class HeadTrackerSerial(HeadTracker):
         try:
             # open serial port
             self._serial = serial.Serial(port=port, baudrate=self._BAUD_RATE, timeout=1)
-            self._logger.info(f'opened tracker "{port}"\n --> {self._serial}')
+            print(f'opened tracker "{port}"\n --> {self._serial}')
 
             # signal to start continuous data output mode
             if self._DATA_INIT_STRING and self._DATA_INIT_STRING != "":
@@ -371,7 +331,7 @@ class HeadTrackerSerial(HeadTracker):
             # read first data line and discard it since it's often incomplete
             self._serial.readline()
         except serial.SerialException as e:
-            self._logger.warning(f"{e.strerror} ... no tracker will be used.")
+            print_warn(f"{e.strerror} ... no tracker will be used.")
             self._serial = None
             self._timeout = 1 / 60  # artificial timeout
 
@@ -397,18 +357,18 @@ class HeadTrackerSerial(HeadTracker):
         line = self._serial.readline()
         try:
             line = line.decode().strip()  # get as string
-            # self._logger.debug(f'line "{line}"')
+            # print(f'line "{line}"')
             result = re.findall(self._DATA_FIND_FORMAT, line)
-            # self._logger.debug(f'result "{result}"')
+            # print(f'result "{result}"')
 
             for i in HeadTracker.DataIndex:
                 if 0 <= self._DATA_RAW_INDEX[i] < len(result):
-                    # self._logger.debug(f'get raw {i} from result {self._DATA_RAW_INDEX[i]}')
+                    # print(f'get raw {i} from result {self._DATA_RAW_INDEX[i]}')
                     self._position_raw[i] = (
                         float(result[self._DATA_RAW_INDEX[i]]) * self._DATA_RAW_SCALE[i]
                     )
         except UnicodeDecodeError:
-            self._logger.warning(f'skipped incomplete TRACKER message "{line}"')
+            print_warn(f'skipped incomplete TRACKER message "{line}"')
 
     def terminate(self):
         """
@@ -417,8 +377,6 @@ class HeadTrackerSerial(HeadTracker):
         """
         if self._serial:
             self._serial.close()
-
-        super().terminate()
 
 
 class HeadTrackerPatriot(HeadTrackerSerial):
