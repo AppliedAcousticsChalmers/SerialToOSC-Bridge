@@ -1,0 +1,9 @@
+name: SerialToOSC-Bridge
+channels:
+  - defaults
+dependencies:
+  - pyserial >=3.4
+  - python >=3.7
+  - pip
+  - pip:
+    - python-osc
