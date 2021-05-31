@@ -6,8 +6,6 @@ from time import sleep
 import serial
 from pythonosc import udp_client
 
-import tools
-
 
 def print_warn(text):
     print(text, file=sys.stderr)
@@ -73,7 +71,12 @@ class HeadTracker(object):
 
     @staticmethod
     def create_instance_by_type(
-        device_type, serial_port, osc_address, osc_port, osc_target
+        device_type,
+        serial_port,
+        osc_address,
+        osc_port,
+        osc_target,
+        verbose_mode,
     ):
         """
         Static method to instantiate one of the from `HeadTracker` deriving classes, depending on
@@ -93,6 +96,8 @@ class HeadTracker(object):
             IP port of OSC target
         osc_target : str
             OSC target address, usually in the shape of "/client/parameter"
+        verbose_mode : int
+            Logging verbosity (0: Waning messages, 1: Status messages, 2: Debug messages)
 
         Returns
         -------
@@ -104,15 +109,68 @@ class HeadTracker(object):
         ValueError
             in case an unknown tracker type is given
         """
-        _type = tools.transform_into_type(device_type, HeadTracker.Type)
+
+        def transform_into_type(str_or_instance, _type):
+            """
+            Parameters
+            ----------
+            str_or_instance : str, Type or None
+                string or instance of type that should be transformed
+            _type : type
+                type that should be transformed into
+
+            Returns
+            -------
+            class
+                type instance
+
+            Raises
+            ------
+            ValueError
+                in case unknown type is given
+            """
+
+            def get_type_str():
+                return f"{_type.__module__}.{_type.__name__}"
+
+            if str_or_instance is None:
+                return None
+            elif isinstance(str_or_instance, str):
+                if str_or_instance.upper() == "NONE":
+                    return None
+                try:
+                    # transform string into enum, will fail in case an invalid type string was given
+                    # noinspection PyUnresolvedReferences
+                    return _type[str_or_instance]
+                except KeyError:
+                    raise ValueError(
+                        f'unknown parameter "{str_or_instance}", see `{get_type_str()}` for reference!'
+                    )
+            elif isinstance(str_or_instance, _type):
+                return str_or_instance
+            else:
+                raise ValueError(
+                    f"unknown parameter type `{type(str_or_instance)}`, see `{get_type_str()}` for "
+                    f"reference!"
+                )
+
+        _type = transform_into_type(device_type, HeadTracker.Type)
         if _type == HeadTracker.Type.AUTO_ROTATE:
-            return HeadTrackerRotate(serial_port, osc_address, osc_port, osc_target)
+            return HeadTrackerRotate(
+                serial_port, osc_address, osc_port, osc_target, verbose_mode
+            )
         elif _type == HeadTracker.Type.POLHEMUS_PATRIOT:
-            return HeadTrackerPatriot(serial_port, osc_address, osc_port, osc_target)
+            return HeadTrackerPatriot(
+                serial_port, osc_address, osc_port, osc_target, verbose_mode
+            )
         elif _type == HeadTracker.Type.POLHEMUS_FASTRACK:
-            return HeadTrackerFastrack(serial_port, osc_address, osc_port, osc_target)
+            return HeadTrackerFastrack(
+                serial_port, osc_address, osc_port, osc_target, verbose_mode
+            )
         elif _type == HeadTracker.Type.RAZOR_AHRS:
-            return HeadTrackerRazor(serial_port, osc_address, osc_port, osc_target)
+            return HeadTrackerRazor(
+                serial_port, osc_address, osc_port, osc_target, verbose_mode
+            )
 
     @staticmethod
     def print_data(array):
@@ -132,16 +190,26 @@ class HeadTracker(object):
                 s = f"{s}, "
         return f"{s}]"
 
-    def __init__(self, serial_port, osc_address, osc_port, osc_target):
+    def __init__(self, serial_port, osc_address, osc_port, osc_target, verbose_mode):
         """
         Create new instance of a positional head tracker in a separate process.
 
         Parameters
         ----------
         serial_port : str
-            system specific path to tracker interface being provided by an appropriate hardware
-            driver
+            system specific path to tracker interface being provided by an appropriate
+            hardware driver
+        osc_address : str
+            IP address of OSC target
+        osc_port : int
+            IP port of OSC target
+        osc_target : str
+            OSC target address, usually in the shape of "/client/parameter"
+        verbose_mode : int
+            Logging verbosity (0: Waning messages, 1: Status messages, 2: Debug messages)
         """
+        self._verbose_mode = verbose_mode
+
         # initialize data arrays
         self._position_raw = [0.0] * len(HeadTracker.DataIndex)
         self._position_zero = [0.0] * len(HeadTracker.DataIndex)
@@ -154,9 +222,11 @@ class HeadTracker(object):
         self._osc_client = udp_client.SimpleUDPClient(
             address=osc_address, port=osc_port
         )
-        print(
-            f"sending OSC messages at ({osc_address}, {osc_port}, {self._osc_target}) ..."
-        )
+
+        if self._verbose_mode:
+            print(
+                f"sending OSC messages at ({osc_address}, {osc_port}, {self._osc_target}) ..."
+            )
 
     def _init_tracker(self, _):
         """
@@ -181,7 +251,60 @@ class HeadTracker(object):
         values regularly and makes the process stay alive until the according
         `multiprocessing.Event` is set.
         """
-        print("running TRACKER ...")
+
+        def transform_into_wrapped_angles(
+            azim, elev, tilt, is_deg=True, deg_round_precision=0
+        ):
+            """
+            Parameters
+            ----------
+            azim : float
+                azimuth / yaw angle (will be wrapped to -180..180 degrees)
+            elev : float
+                elevation / pitch angle (will be wrapped to -90..90 degrees)
+            tilt : float
+                tilt / roll angle (will be wrapped to -180..180 degrees)
+            is_deg : bool, optional
+                if provided and delivered values are in degrees, radians otherwise
+            deg_round_precision : int, optional
+                number of decimals to round to (only in case of angles in degrees)
+
+            Returns
+            -------
+            list of float
+                azimuth, elevation and tilt angles in degrees or radians being wrapped
+            """
+            if is_deg:
+                _AZIM_WRAP = 360
+                _ELEV_WRAP = 180
+                _TILT_WRAP = 360
+            else:
+                import math
+
+                _AZIM_WRAP = 2 * math.pi
+                _ELEV_WRAP = math.pi
+                _TILT_WRAP = 2 * math.pi
+
+            azim = azim % _AZIM_WRAP
+            elev = elev % _ELEV_WRAP
+            tilt = tilt % _TILT_WRAP
+
+            if azim > _AZIM_WRAP / 2:
+                azim -= _AZIM_WRAP
+            if elev > _ELEV_WRAP / 2:
+                elev -= _ELEV_WRAP
+            if tilt > _TILT_WRAP / 2:
+                tilt -= _TILT_WRAP
+
+            if is_deg:
+                azim = round(azim, ndigits=deg_round_precision)
+                elev = round(elev, ndigits=deg_round_precision)
+                tilt = round(tilt, ndigits=deg_round_precision)
+
+            return [azim, elev, tilt]
+
+        if self._verbose_mode:
+            print("running TRACKER ...")
         try:
             while True:
                 # individual implementation to read data
@@ -194,7 +317,7 @@ class HeadTracker(object):
                     )
 
                 # wrap shared values
-                angles_deg = tools.transform_into_wrapped_angles(
+                angles_deg = transform_into_wrapped_angles(
                     azim=self._position_shared[HeadTracker.DataIndex.AZIM],
                     elev=self._position_shared[HeadTracker.DataIndex.ELEV],
                     tilt=self._position_shared[HeadTracker.DataIndex.TILT],
@@ -202,6 +325,8 @@ class HeadTracker(object):
                 )
 
                 # send shared data
+                if self._verbose_mode > 1:
+                    print(f'Sending message "{angles_deg}"')
                 self._osc_client.send_message(
                     address=self._osc_target, value=angles_deg
                 )
@@ -224,9 +349,10 @@ class HeadTracker(object):
         for i in HeadTracker.DataIndex:
             self._position_zero[i] = self._position_raw[i]
 
-        print_warn(
-            f"setting head tracker zero position to {HeadTracker.print_data(self._position_zero)}."
-        )
+        if self._verbose_mode:
+            print(
+                f"setting head tracker zero position to {HeadTracker.print_data(self._position_zero)}."
+            )
 
 
 class HeadTrackerRotate(HeadTracker):
@@ -251,10 +377,11 @@ class HeadTrackerRotate(HeadTracker):
         self._timeout = 1 / 60  # data send rate
         self._position_step = [0, 0, 0, 0.5, 0, 0]  # x, y, z, azim, elev, tilt
 
-        print(
-            f'opened tracker "AUTO_ROTATE"\n'
-            f" --> send_rate: {1 / self._timeout} Hz, step_size: {self._position_step[3:]} deg"
-        )
+        if self._verbose_mode:
+            print(
+                f'opened tracker "AUTO_ROTATE"\n'
+                f" --> send_rate: {1 / self._timeout} Hz, step_size: {self._position_step[3:]} deg"
+            )
 
     def _read_data(self):
         """
@@ -321,7 +448,8 @@ class HeadTrackerSerial(HeadTracker):
         try:
             # open serial port
             self._serial = serial.Serial(port=port, baudrate=self._BAUD_RATE, timeout=1)
-            print(f'opened tracker "{port}"\n --> {self._serial}')
+            if self._verbose_mode:
+                print(f'opened tracker "{port}"\n --> {self._serial}')
 
             # signal to start continuous data output mode
             if self._DATA_INIT_STRING and self._DATA_INIT_STRING != "":
@@ -331,9 +459,11 @@ class HeadTrackerSerial(HeadTracker):
             # read first data line and discard it since it's often incomplete
             self._serial.readline()
         except serial.SerialException as e:
-            print_warn(f"{e.strerror} ... no tracker will be used.")
             self._serial = None
             self._timeout = 1 / 60  # artificial timeout
+
+            # raise ValueError(e.strerror)  # this did not yield a sting on Windows
+            raise ValueError(e.args[0])
 
     def _init_config(self):
         """
@@ -357,13 +487,17 @@ class HeadTrackerSerial(HeadTracker):
         line = self._serial.readline()
         try:
             line = line.decode().strip()  # get as string
-            # print(f'line "{line}"')
+            if self._verbose_mode > 1:
+                print(f'line "{line}"')
+
             result = re.findall(self._DATA_FIND_FORMAT, line)
-            # print(f'result "{result}"')
+            if self._verbose_mode > 1:
+                print(f'result "{result}"')
 
             for i in HeadTracker.DataIndex:
                 if 0 <= self._DATA_RAW_INDEX[i] < len(result):
-                    # print(f'get raw {i} from result {self._DATA_RAW_INDEX[i]}')
+                    if self._verbose_mode > 1:
+                        print(f"get raw {i} from result {self._DATA_RAW_INDEX[i]}")
                     self._position_raw[i] = (
                         float(result[self._DATA_RAW_INDEX[i]]) * self._DATA_RAW_SCALE[i]
                     )

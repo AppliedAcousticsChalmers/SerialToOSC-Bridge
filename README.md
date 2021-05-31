@@ -26,7 +26,10 @@ See the [usage examples section](#usage-examples) for currently supported hardwa
   `conda activate SerialToOSC-Bridge`
     
 ## Usage Examples
-* TBC
+* Review the available command line arguments:<br/>
+`python SerialToOSC-Bridge.py --help`
+* to be continued ...<br/>
+`python SerialToOSC-Bridge.py ...`
 
 ## Credits
 Written by [Hannes Helmholz](http://www.ta.chalmers.se/people/hannes-helmholz/).
