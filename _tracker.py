@@ -354,6 +354,14 @@ class HeadTracker(object):
                 f"setting head tracker zero position to {HeadTracker.print_data(self._position_zero)}."
             )
 
+    def terminate(self):
+        """
+        Terminate the tracker process. Deriving classes can override this
+        function to perform  actions in required for individual tracking
+        hardware.
+        """
+        pass
+
 
 class HeadTrackerRotate(HeadTracker):
     """

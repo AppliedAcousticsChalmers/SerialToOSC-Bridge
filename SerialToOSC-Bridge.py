@@ -67,6 +67,7 @@ if __name__ == "__main__":
     # parse command line arguments
     args = parse_cmd_args()
 
+    tracker = None
     try:
         # initialize tracker and with OSC client
         tracker = HeadTracker.create_instance_by_type(
@@ -82,8 +83,15 @@ if __name__ == "__main__":
         # keyboard interrupts and gracefully halt execution)
         tracker.run()
 
+        # # TODO: How to implement calibration by setting the reference position?
+        # tracker.set_zero_position()
+
     except ValueError as e:
         print(e.args[0])
+
+        if tracker is not None:
+            tracker.terminate()
+
         exit(1)
 
     if args.VERBOSE_MODE:
